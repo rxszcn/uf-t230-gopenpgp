@@ -163,40 +163,91 @@ func (eh *encryptionHandle) validate() error {
 
 // armorChecksumRequired determines if an armor checksum should be appended or not.
 // The OpenPGP Crypto-Refresh mandates that no checksum should be appended with the new packets.
+// The decision follows the version of the data packet the encryption paths
+// will actually write: no checksum is appended if and only if a SEIPDv2 (AEAD)
+// packet is produced. The profile alone is not a reliable proxy for this,
+// e.g., a v4 profile encrypting towards v6 recipients still yields SEIPDv2
+// packets.
 func (eh *encryptionHandle) armorChecksumRequired() bool {
 	if !constants.ArmorChecksumEnabled {
 		// If the default behavior is no checksum, we can ignore
 		// the logic for the RFC9580 check.
 		return false
 	}
-	encryptionConfig := eh.profile.EncryptionConfig()
-	if encryptionConfig.AEADConfig == nil {
-		return true
+	return !eh.seipdV2Output()
+}
+
+// seipdV2Output reports whether this handle will write a SEIPDv2 (AEAD)
+// encrypted data packet. It mirrors the packet version selection of the
+// encryption paths:
+//   - public-key encryption: SEIPDv2 iff every (hidden) recipient's primary
+//     self-signature signals SEIPDv2 support, independent of the profile's
+//     AEAD configuration.
+//   - password-based encryption: SEIPDv2 iff the profile configures AEAD.
+//   - session key encryption: SEIPDv2 iff the session key is a v6 key.
+//
+// For (plain) detached signatures the data stream is always encrypted with a
+// session key, so the session key rule applies.
+func (eh *encryptionHandle) seipdV2Output() bool {
+	if eh.DetachedSignature || eh.PlainDetachedSignature {
+		return eh.detachedStreamSessionKeyV6()
 	}
+	switch {
+	case eh.Recipients.CountEntities() > 0 || eh.HiddenRecipients.CountEntities() > 0:
+		return eh.allRecipientsSEIPDv2()
+	case eh.Password != nil:
+		return eh.profile.EncryptionConfig().AEAD() != nil
+	case eh.SessionKey != nil:
+		return eh.SessionKey.v6
+	default:
+		return false
+	}
+}
+
+// detachedStreamSessionKeyV6 mirrors the session key dependent packet version
+// selection of the detached signature encryption paths. If no session key is
+// provided, one is generated during encryption with v6 capabilities iff the
+// profile configures AEAD and all recipients support SEIPDv2.
+func (eh *encryptionHandle) detachedStreamSessionKeyV6() bool {
+	if eh.SessionKey != nil {
+		return eh.SessionKey.v6
+	}
+	if eh.profile.EncryptionConfig().AEAD() == nil {
+		return false
+	}
+	return eh.allRecipientsSEIPDv2()
+}
+
+// allRecipientsSEIPDv2 reports whether every recipient's primary
+// self-signature signals SEIPDv2 support, mirroring the AEAD selection in
+// go-crypto's public-key encryption. It returns false if a self-signature
+// cannot be determined.
+func (eh *encryptionHandle) allRecipientsSEIPDv2() bool {
+	encryptionConfig := eh.profile.EncryptionConfig()
 	checkTime := eh.clock()
 	if eh.Recipients != nil {
 		for _, recipient := range eh.Recipients.entities {
 			primarySelfSignature, err := recipient.PrimarySelfSignature(checkTime, encryptionConfig)
-			if err != nil {
-				return true
+			if err != nil || primarySelfSignature == nil {
+				return false
 			}
 			if !primarySelfSignature.SEIPDv2 {
-				return true
+				return false
 			}
 		}
 	}
 	if eh.HiddenRecipients != nil {
 		for _, recipient := range eh.HiddenRecipients.entities {
 			primarySelfSignature, err := recipient.PrimarySelfSignature(checkTime, encryptionConfig)
-			if err != nil {
-				return true
+			if err != nil || primarySelfSignature == nil {
+				return false
 			}
 			if !primarySelfSignature.SEIPDv2 {
-				return true
+				return false
 			}
 		}
 	}
-	return false
+	return true
 }
 
 type armoredWriteCloser struct {

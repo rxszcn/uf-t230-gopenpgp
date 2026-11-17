@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ProtonMail/go-crypto/openpgp/packet"
 	openpgp "github.com/ProtonMail/go-crypto/openpgp/v2"
 	"github.com/ProtonMail/gopenpgp/v3/profile"
 	"github.com/stretchr/testify/assert"
@@ -1034,6 +1035,112 @@ func TestEncryptArmor(t *testing.T) {
 func containsChecksum(armored string) bool {
 	re := regexp.MustCompile(`=([A-Za-z0-9+/]{4})\s*-----END PGP MESSAGE-----`)
 	return re.MatchString(armored)
+}
+
+func testMaterialForProfile(name string) *testMaterial {
+	for _, material := range testMaterialForProfiles {
+		if material.profileName == name {
+			return material
+		}
+	}
+	return nil
+}
+
+// seipdVersion returns the version of the message's SEIPD data packet,
+// i.e., 1 for SEIPDv1 (MDC) and 2 for SEIPDv2 (AEAD).
+func seipdVersion(t *testing.T, pgpMsg *PGPMessage) int {
+	t.Helper()
+	packets := packet.NewReader(bytes.NewReader(pgpMsg.DataPacket))
+	p, err := packets.Next()
+	if err != nil {
+		t.Fatal("Expected a data packet in the encrypted message, got:", err)
+	}
+	se, ok := p.(*packet.SymmetricallyEncrypted)
+	if !ok {
+		t.Fatalf("Expected a SEIPD data packet, got %T", p)
+	}
+	return se.Version
+}
+
+// TestEncryptArmorV4ProfileV6Recipient tests that encrypting with a v4
+// (compatibility) profile towards v6 recipients produces SEIPDv2 packets and
+// thus an armor without a CRC24 checksum, and that the message roundtrips.
+func TestEncryptArmorV4ProfileV6Recipient(t *testing.T) {
+	v4Material := testMaterialForProfile("Default")
+	v6Material := testMaterialForProfile("RFC9580")
+	encHandle, err := v4Material.pgp.Encryption().
+		Recipients(v6Material.keyRingTestPublic).
+		New()
+	if err != nil {
+		t.Fatal("Expected no error while building encryption handle, got:", err)
+	}
+	pgpMsg, err := encHandle.Encrypt([]byte(testMessageString))
+	if err != nil {
+		t.Fatal("Expected no error in encryption, got:", err)
+	}
+	if version := seipdVersion(t, pgpMsg); version != 2 {
+		t.Fatalf("Expected a SEIPDv2 (AEAD) data packet for v6 recipients, got version %d", version)
+	}
+	armoredData, err := pgpMsg.Armor()
+	if err != nil {
+		t.Fatal("Armoring failed, got:", err)
+	}
+	if containsChecksum(armoredData) {
+		t.Fatal("Expected no armor checksum for SEIPDv2 messages, even with a v4 profile")
+	}
+	decHandle, err := v6Material.pgp.Decryption().
+		DecryptionKeys(v6Material.keyRingTestPrivate).
+		New()
+	if err != nil {
+		t.Fatal("Expected no error while building decryption handle, got:", err)
+	}
+	decryptionResult, err := decHandle.Decrypt([]byte(armoredData), Armor)
+	if err != nil {
+		t.Fatal("Expected no error while decrypting the armored message, got:", err)
+	}
+	if !bytes.Equal(decryptionResult.Bytes(), []byte(testMessageString)) {
+		t.Fatalf("Expected the decrypted data to be %s got %s", testMessageString, string(decryptionResult.Bytes()))
+	}
+}
+
+// TestEncryptArmorV4Baseline tests that a pure v4 setup (v4 profile, v4
+// recipients) keeps producing SEIPDv1 packets with a CRC24 checksum in the
+// armor, and that the message roundtrips.
+func TestEncryptArmorV4Baseline(t *testing.T) {
+	v4Material := testMaterialForProfile("Default")
+	encHandle, err := v4Material.pgp.Encryption().
+		Recipients(v4Material.keyRingTestPublic).
+		New()
+	if err != nil {
+		t.Fatal("Expected no error while building encryption handle, got:", err)
+	}
+	pgpMsg, err := encHandle.Encrypt([]byte(testMessageString))
+	if err != nil {
+		t.Fatal("Expected no error in encryption, got:", err)
+	}
+	if version := seipdVersion(t, pgpMsg); version != 1 {
+		t.Fatalf("Expected a SEIPDv1 data packet for v4 recipients, got version %d", version)
+	}
+	armoredData, err := pgpMsg.Armor()
+	if err != nil {
+		t.Fatal("Armoring failed, got:", err)
+	}
+	if !containsChecksum(armoredData) {
+		t.Fatal("Expected an armor checksum for SEIPDv1 messages")
+	}
+	decHandle, err := v4Material.pgp.Decryption().
+		DecryptionKeys(v4Material.keyRingTestPrivate).
+		New()
+	if err != nil {
+		t.Fatal("Expected no error while building decryption handle, got:", err)
+	}
+	decryptionResult, err := decHandle.Decrypt([]byte(armoredData), Armor)
+	if err != nil {
+		t.Fatal("Expected no error while decrypting the armored message, got:", err)
+	}
+	if !bytes.Equal(decryptionResult.Bytes(), []byte(testMessageString)) {
+		t.Fatalf("Expected the decrypted data to be %s got %s", testMessageString, string(decryptionResult.Bytes()))
+	}
 }
 
 func testEncryptDecrypt(
